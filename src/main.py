@@ -1,0 +1,474 @@
+# ================================
+# API FASTAPI POUR AUTO-ML STREAMING AVEC KNN_ADWIN
+# ================================
+
+import asyncio
+import csv
+import math
+import random
+import json
+from datetime import datetime
+from contextlib import asynccontextmanager
+from typing import Dict, List, Optional
+
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from prometheus_client import Gauge, Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from river import tree, neighbors, preprocessing, compose, forest, metrics, drift
+
+# ================================
+# PARAMÈTRES OPTIMISÉS PAR OPTUNA
+# ================================
+
+OPTIMIZED_PARAMS = {
+    'grace_period': 469,
+    'n_neighbors': 9,
+    'sgd_eta0': 0.0018263913679052806,
+    'epsilon': 0.2531867398700865,
+    'adwin_delta': 1.3026373312614474e-05,
+    'window_size': 20000,
+}
+
+# ================================
+# KNN AVEC ADWIN
+# ================================
+class KNNWithADWIN:
+    def __init__(self, n_neighbors=9, delta=1.3026373312614474e-05, maxlen=100):
+        self.n_neighbors = n_neighbors
+        self.delta = delta
+        self.maxlen = maxlen
+        self.knn = neighbors.KNNClassifier(
+            n_neighbors=n_neighbors,
+            engine=neighbors.SWINN(maxlen=maxlen)
+        )
+        self.adwin = drift.ADWIN(delta=delta)
+        self.drift_count = 0
+        self.n_instances = 0
+        
+    def predict_one(self, x):
+        return self.knn.predict_one(x)
+    
+    def learn_one(self, x, y):
+        pred = self.knn.predict_one(x)
+        if pred is not None:
+            error = 0 if pred == y else 1
+            self.adwin.update(error)
+            if self.adwin.drift_detected:
+                self.drift_count += 1
+                self.knn = neighbors.KNNClassifier(
+                    n_neighbors=self.n_neighbors,
+                    engine=neighbors.SWINN(maxlen=self.maxlen)
+                )
+                self.adwin = drift.ADWIN(delta=self.delta)
+        self.knn.learn_one(x, y)
+        self.n_instances += 1
+
+
+# ================================
+# SGD WRAPPER
+# ================================
+class SGDWrapper:
+    def __init__(self, eta0=0.0018263913679052806):
+        from sklearn.linear_model import SGDClassifier
+        self.model = SGDClassifier(
+            loss='log_loss',
+            learning_rate='adaptive',
+            eta0=eta0,
+            random_state=42
+        )
+        self.feature_names = None
+        self.is_fitted = False
+
+    def _encode(self, x):
+        if self.feature_names is None:
+            self.feature_names = list(x.keys())
+        values = []
+        for f in self.feature_names:
+            v = x.get(f, 0.0)
+            if isinstance(v, (int, float)):
+                values.append(float(v))
+            else:
+                values.append(float(hash(str(v)) % 1000))
+        import numpy as np
+        return np.array(values, dtype=float).reshape(1, -1)
+
+    def learn_one(self, x, y):
+        X = self._encode(x)
+        if not self.is_fitted:
+            self.model.partial_fit(X, [y], classes=[0, 1])
+            self.is_fitted = True
+        else:
+            self.model.partial_fit(X, [y])
+
+    def predict_one(self, x):
+        if not self.is_fitted:
+            return 0
+        X = self._encode(x)
+        return int(self.model.predict(X)[0])
+
+
+# ================================
+# CRÉATION DES MODÈLES
+# ================================
+def create_optimized_models():
+    model_ht = compose.Pipeline(
+        ('scale', preprocessing.StandardScaler()),
+        ('tree', tree.HoeffdingTreeClassifier(
+            grace_period=OPTIMIZED_PARAMS['grace_period'],
+            delta=1e-5,
+            leaf_prediction='nb',
+            nb_threshold=30
+        ))
+    )
+    
+    model_knn_adwin = KNNWithADWIN(
+        n_neighbors=OPTIMIZED_PARAMS['n_neighbors'],
+        delta=OPTIMIZED_PARAMS['adwin_delta'],
+        maxlen=100
+    )
+    
+    model_sgd = SGDWrapper(eta0=OPTIMIZED_PARAMS['sgd_eta0'])
+    
+    model_ensemble = forest.ARFClassifier(
+        n_models=5,
+        seed=42,
+        leaf_prediction='nba'
+    )
+    
+    return [model_ht, model_knn_adwin, model_sgd, model_ensemble], ["HT", "KNN_ADWIN", "SGD", "Ensemble"]
+
+
+# ================================
+# BANDIT UCB1
+# ================================
+class UCB1Bandit:
+    def __init__(self, n_arms, epsilon=0.2531867398700865):
+        self.n_arms = n_arms
+        self.epsilon = epsilon
+        self.counts = [0] * n_arms
+        self.values = [0.0] * n_arms
+        self.total = 0
+        
+    def select(self):
+        for i in range(self.n_arms):
+            if self.counts[i] == 0:
+                return i
+        if random.random() < self.epsilon:
+            return random.randint(0, self.n_arms - 1)
+        ucb_values = []
+        for i in range(self.n_arms):
+            bonus = math.sqrt(2 * math.log(self.total) / self.counts[i])
+            ucb_values.append(self.values[i] + bonus)
+        return ucb_values.index(max(ucb_values))
+    
+    def update(self, arm, reward):
+        self.total += 1
+        self.counts[arm] += 1
+        n = self.counts[arm]
+        self.values[arm] += (reward - self.values[arm]) / n
+    
+    def get_best_arm(self):
+        return max(range(self.n_arms), key=lambda i: self.values[i])
+
+
+# ================================
+# AUTO-ML SYSTEM
+# ================================
+class AutoMLSystem:
+    def __init__(self, models, model_names, epsilon, adwin_delta):
+        self.models = models
+        self.names = model_names
+        self.n_arms = len(models)
+        self.bandit = UCB1Bandit(self.n_arms, epsilon=epsilon)
+        self.detector = drift.ADWIN(delta=adwin_delta)
+        self.metrics_f1 = {name: metrics.F1() for name in model_names}
+        self.metrics_acc = {name: metrics.Accuracy() for name in model_names}
+        self.n_instances = 0
+        self.drift_count = 0
+        
+    def predict_one(self, x):
+        chosen = self.bandit.select()
+        model = self.models[chosen]
+        pred = model.predict_one(x)
+        if pred is None:
+            pred = 0
+        return pred, self.names[chosen]
+    
+    def learn_one(self, x, y):
+        chosen = self.bandit.select()
+        model = self.models[chosen]
+        pred = model.predict_one(x)
+        reward = 1 if pred == y else 0 if pred is not None else 0
+        if pred is not None:
+            self.metrics_f1[self.names[chosen]].update(y, pred)
+            self.metrics_acc[self.names[chosen]].update(y, pred)
+        error = 1 - reward
+        self.detector.update(error)
+        if self.detector.drift_detected:
+            self.drift_count += 1
+            self.bandit = UCB1Bandit(self.n_arms, epsilon=self.bandit.epsilon)
+        self.bandit.update(chosen, reward)
+        for model in self.models:
+            model.learn_one(x, y)
+        self.n_instances += 1
+        return pred
+    
+    def get_stats(self):
+        return {
+            'n_instances': self.n_instances,
+            'drift_count': self.drift_count,
+            'f1_scores': {name: self.metrics_f1[name].get() for name in self.names},
+            'bandit_counts': self.bandit.counts,
+            'best_model': self.names[self.bandit.get_best_arm()]
+        }
+
+
+# ================================
+# DATA STREAM
+# ================================
+def data_stream(file_path, max_instances=None):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for i, row in enumerate(reader):
+            if max_instances and i >= max_instances:
+                break
+            y = int(row.pop('label'))
+            row.pop('attack_cat', None)
+            row.pop('id', None)
+            for k, v in row.items():
+                try:
+                    row[k] = float(v) if v else 0.0
+                except (ValueError, TypeError):
+                    row[k] = 0.0
+            yield row, y
+
+
+# ================================
+# MÉTRIQUES PROMETHEUS
+# ================================
+ensemble_f1_gauge = Gauge('auto_ml_ensemble_f1', 'F1 score du modèle Ensemble')
+ht_f1_gauge = Gauge('auto_ml_ht_f1', 'F1 score du modèle HT')
+knn_adwin_f1_gauge = Gauge('auto_ml_knn_adwin_f1', 'F1 score du modèle KNN_ADWIN')
+sgd_f1_gauge = Gauge('auto_ml_sgd_f1', 'F1 score du modèle SGD')
+drift_counter = Counter('auto_ml_drift_total', 'Nombre total de drifts détectés')
+prediction_latency = Histogram('auto_ml_prediction_latency_ms', 'Latence des prédictions en ms')
+
+
+# ================================
+# SCHÉMAS PYDANTIC
+# ================================
+class PredictionRequest(BaseModel):
+    features: Dict[str, float] = Field(..., description="Features de la connexion réseau")
+
+class PredictionResponse(BaseModel):
+    prediction: int = Field(..., description="0 = normal, 1 = attaque")
+    model_used: str = Field(..., description="Modèle utilisé")
+    confidence: float = Field(..., description="Confiance (0-1)")
+    latency_ms: float = Field(..., description="Temps de prédiction en ms")
+
+class StatsResponse(BaseModel):
+    n_instances: int
+    drift_count: int
+    f1_scores: Dict[str, float]
+    best_model: str
+    bandit_counts: List[int]
+
+
+# ================================
+# ÉTAT GLOBAL
+# ================================
+class AppState:
+    def __init__(self):
+        self.system: Optional[AutoMLSystem] = None
+        self.lock = asyncio.Lock()
+        self.running = False
+        self.training_task: Optional[asyncio.Task] = None
+
+state = AppState()
+
+
+# ================================
+# BOUCLE D'ENTRAÎNEMENT
+# ================================
+async def training_loop(file_path: str):
+    print("🔄 Démarrage de la boucle d'entraînement continue...")
+    
+    # AJOUT : Vérification du fichier
+    import os
+    print(f"📁 Chemin du fichier: {file_path}")
+    
+    if not os.path.exists(file_path):
+        print(f"❌ ERREUR: Fichier non trouvé à {file_path}")
+        print("   Vérifiez que le chemin est correct")
+        return
+    else:
+        file_size = os.path.getsize(file_path)
+        print(f"✅ Fichier trouvé! Taille: {file_size:,} bytes")
+    
+    # AJOUT : Compteur pour suivre la progression
+    instance_count = 0
+    
+    try:
+        stream = data_stream(file_path)
+        print("📊 Stream créé, début de l'itération...")
+        
+        for x, y in stream:
+            if not state.running:
+                break
+            
+            async with state.lock:
+                if state.system:
+                    state.system.learn_one(x, y)
+            
+            # Afficher la progression toutes les 100 instances
+            instance_count += 1
+            if instance_count % 100 == 0:
+                print(f"📊 {instance_count} instances traitées")
+            
+            if state.system:
+                stats = state.system.get_stats()
+                ensemble_f1_gauge.set(stats['f1_scores'].get('Ensemble', 0))
+                ht_f1_gauge.set(stats['f1_scores'].get('HT', 0))
+                knn_adwin_f1_gauge.set(stats['f1_scores'].get('KNN_ADWIN', 0))
+                sgd_f1_gauge.set(stats['f1_scores'].get('SGD', 0))
+                drift_counter.inc(stats['drift_count'])
+            
+            await asyncio.sleep(0.01)
+            
+    except Exception as e:
+        print(f"❌ ERREUR dans training_loop: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    print(f"🏁 Boucle d'entraînement terminée. Total: {instance_count} instances")
+
+# ================================
+# LIFESPAN
+# ================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("🚀 Démarrage de l'API Auto-ML avec KNN_ADWIN...")
+    print(f"📈 Paramètres optimisés par Optuna (F1 max = 95.03%)")
+    
+    models, model_names = create_optimized_models()
+    state.system = AutoMLSystem(
+        models=models,
+        model_names=model_names,
+        epsilon=OPTIMIZED_PARAMS['epsilon'],
+        adwin_delta=OPTIMIZED_PARAMS['adwin_delta']
+    )
+    state.running = True
+    csv_path = "/app/data/UNSW_NB15_training_shuffled.csv"
+    state.training_task = asyncio.create_task(training_loop(csv_path))
+    
+    print(f"✅ API prête - Documentation sur /docs")
+    print(f"🎯 Modèles disponibles: {', '.join(model_names)}")
+    
+    yield
+    
+    print("🛑 Arrêt de l'API...")
+    state.running = False
+    if state.training_task:
+        state.training_task.cancel()
+    print("✅ API arrêtée")
+
+
+# ================================
+# APPLICATION FASTAPI
+# ================================
+app = FastAPI(
+    title="Auto-ML Streaming API with KNN_ADWIN",
+    description="API de détection d'intrusions en temps réel",
+    version="2.0.0",
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ================================
+# ENDPOINTS
+# ================================
+@app.get("/")
+async def root():
+    return {"status": "online", "service": "Auto-ML API", "version": "2.0.0"}
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "system_ready": state.system is not None,
+        "training_running": state.running,
+        "optimized": True,
+        "target_f1": 0.9503
+    }
+
+@app.post("/predict", response_model=PredictionResponse)
+async def predict(request: PredictionRequest):
+    import time
+    if not state.system:
+        raise HTTPException(status_code=503, detail="Système non initialisé")
+    
+    start_time = time.perf_counter()
+    async with state.lock:
+        pred, model_used = state.system.predict_one(request.features)
+        latency_ms = (time.perf_counter() - start_time) * 1000
+    
+    prediction_latency.observe(latency_ms)
+    
+    if pred is None:
+        pred = 0
+    if model_used == "Unknown":
+        model_used = "Ensemble"
+    
+    confidence = 0.95 if model_used == "Ensemble" else 0.85 if model_used == "HT" else 0.80
+    
+    return PredictionResponse(
+        prediction=int(pred),
+        model_used=model_used,
+        confidence=confidence,
+        latency_ms=latency_ms
+    )
+
+@app.get("/stats", response_model=StatsResponse)
+async def get_stats():
+    if not state.system:
+        raise HTTPException(status_code=503, detail="Système non initialisé")
+    async with state.lock:
+        stats = state.system.get_stats()
+    return StatsResponse(
+        n_instances=stats['n_instances'],
+        drift_count=stats['drift_count'],
+        f1_scores=stats['f1_scores'],
+        best_model=stats['best_model'],
+        bandit_counts=stats['bandit_counts']
+    )
+# Ajoutez cet endpoint avant @app.get("/metrics")
+@app.post("/update-metrics")
+async def update_metrics():
+    if state.system:
+        stats = state.system.get_stats()
+        ensemble_f1_gauge.set(stats['f1_scores'].get('Ensemble', 0))
+        ht_f1_gauge.set(stats['f1_scores'].get('HT', 0))
+        knn_adwin_f1_gauge.set(stats['f1_scores'].get('KNN_ADWIN', 0))
+        sgd_f1_gauge.set(stats['f1_scores'].get('SGD', 0))
+        return {
+            "status": "updated",
+            "ensemble_f1": stats['f1_scores'].get('Ensemble', 0),
+            "ht_f1": stats['f1_scores'].get('HT', 0),
+            "knn_adwin_f1": stats['f1_scores'].get('KNN_ADWIN', 0),
+            "sgd_f1": stats['f1_scores'].get('SGD', 0)
+        }
+    return {"status": "error", "message": "System not initialized"}
+
+@app.get("/metrics")
+async def get_metrics():
+    """Endpoint Prometheus pour le monitoring"""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)

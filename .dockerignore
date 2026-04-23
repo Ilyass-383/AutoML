@@ -1,0 +1,28 @@
+# Environnements virtuels
+venv/
+env/
+.venv/
+__pycache__/
+*.pyc
+
+# Données (pour éviter de copier les gros fichiers deux fois)
+# data/ est déjà copié explicitement
+
+# Fichiers d'IDE
+.vscode/
+.idea/
+*.swp
+
+# Git
+.git/
+.gitignore
+
+# Logs
+*.log
+
+# Notebooks
+*.ipynb
+
+# Tests
+tests/
+pytest_cache/

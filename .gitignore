@@ -1,0 +1,29 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+env/
+.venv/
+
+# Docker
+*.log
+*.pid
+
+# Data (trop gros pour GitHub)
+data/*.csv
+*.csv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+*.key
+*.pem

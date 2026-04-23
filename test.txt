@@ -1,0 +1,48 @@
+ATTAQUE
+{
+  "features": {
+    "dbytes": 50,
+    "dload": 0.1,
+    "dpkts": 5,
+    "dttl": 128,
+    "dur": 0.3,
+    "rate": 0.05,
+    "sbytes": 100,
+    "sload": 0.1,
+    "spkts": 10,
+    "sttl": 64
+  }
+}
+
+{
+  "features": {
+    "dbytes": 2000,
+    "dload": 0.6,
+    "dpkts": 200,
+    "dttl": 64,
+    "dur": 5.2,
+    "rate": 0.7,
+    "sbytes": 10000,
+    "sload": 0.75,
+    "spkts": 500,
+    "sttl": 64
+  }
+}
+ NORMALE :
+{
+  "features": {
+    "dbytes": 50,
+    "dload": 0.1,
+    "dpkts": 5,
+    "dttl": 128,
+    "dur": 0.3,
+    "rate": 0.05,
+    "sbytes": 100,
+    "sload": 0.1,
+    "spkts": 10,
+    "sttl": 64
+  }
+}
+
+
+py -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
