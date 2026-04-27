@@ -68,6 +68,26 @@ Système de **détection d'intrusions en temps réel** utilisant l'**Auto-ML** a
 │ │ (5 arbres) │ │
 │ │ 95.73% F1 │ │
 │ └─────────────────┘ │
+
+## 🚀 Démarrage rapide
+
+### Prérequis
+- Docker & Docker Compose
+- Git
+
+### Installation
+
+```bash
+# 1. Clonez le dépôt
+git clone https://github.com/IlyassRbaai/projet-ds-ia4-g4_1.git
+cd projet-ds-ia4-g4_1
+
+# 2. Lancez tous les services
+docker-compose up -d
+
+# 3. Vérifiez que tout tourne
+docker-compose ps
+
 │ │
 │ ┌─────────────────────────────────────────────────────────┐ │
 │ │ MONITORING │ │
