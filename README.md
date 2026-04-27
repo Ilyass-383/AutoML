@@ -79,8 +79,8 @@ Système de **détection d'intrusions en temps réel** utilisant l'**Auto-ML** a
 
 ```bash
 # 1. Clonez le dépôt
-git clone https://github.com/IlyassRbaai/projet-ds-ia4-g4_1.git
-cd projet-ds-ia4-g4_1
+git clone https://github.com/Ilyass-383/AutoML.git
+cd AutoML
 
 # 2. Lancez tous les services
 docker-compose up -d
